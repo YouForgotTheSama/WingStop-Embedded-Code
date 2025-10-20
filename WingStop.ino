@@ -1,16 +1,3 @@
-// RP2040 (Earle Philhower core) — BNO055 + BMP3XX + XBee (values-only CSV @ 1 Hz)
-// Buses/pins (Philhower supports remapping):
-//   I2C0 (Wire)  : SDA=GP12, SCL=GP13  -> BMP3XX
-//   I2C1 (Wire1) : SDA=GP4,  SCL=GP5   -> BNO055
-//   UART1        : TX=GP0 -> XBee DIN, RX=GP1 <- XBee DOUT  @ 9600
-//
-// Telemetry order:
-//   TEAMID,COUNT,BMP_ALT_M,BMP_TEMP_C,GYRO_R_DPS,GYRO_P_DPS,GYRO_Y_DPS
-
-#if defined(ARDUINO_ARCH_MBED)
-  #error "This sketch requires the Earle Philhower RP2040 core. In Arduino IDE: install 'Raspberry Pi RP2040 Boards' by Earle Philhower and select an RP2040 board from that core."
-#endif
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -20,26 +7,31 @@
 #include "Adafruit_BMP3XX.h"
 
 // ----------- Config -----------
-#define TEAMID                 5
-#define XBEE_BAUD              9600
-#define XBEE_TX_PIN            0   // GP0 -> XBee DIN
-#define XBEE_RX_PIN            1   // GP1 <- XBee DOUT
-#define SEALEVELPRESSURE_HPA   (1013.25)
-const uint32_t PRINT_INTERVAL_MS   = 1000;   // 1 Hz
-const uint32_t REINIT_INTERVAL_MS  = 5000;   // try reinit every 5 s if a sensor is down
+#define TEAMID               5
+#define XBEE_BAUD            9600
+#define XBEE_TX_PIN          0   // GP0 -> XBee DIN
+#define XBEE_RX_PIN          1   // GP1 <- XBee DOUT
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+const uint32_t PRINT_INTERVAL_MS  = 1000;  // 1 Hz
+const uint32_t REINIT_INTERVAL_MS = 5000;  // reinit tries if a sensor is down
 
 // ----------- Globals ----------
-Adafruit_BMP3XX bmp;                       // On Wire (I2C0)
-Adafruit_BNO055 bno(55, 0x28, &Wire1);     // On Wire1 (I2C1); use 0x29 if ADR high
+Adafruit_BMP3XX bmp;                   // I2C0 (Wire) -> BMP3XX
+Adafruit_BNO055 bno(55, 0x28, &Wire1); // I2C1 (Wire1) -> BNO055 (0x29 if ADR high)
 
 uint32_t lastPrint        = 0;
 uint32_t packetCount      = 0;
-bool bno_ok               = false;
-bool bmp_ok               = false;
+bool     bno_ok           = false;
+bool     bmp_ok           = false;
 uint32_t lastBNOAttemptMs = 0;
 uint32_t lastBMPAttemptMs = 0;
 
-// Values-only CSV emitter in the requested order
+// Altitude baseline: set once on the first good BMP reading after boot
+bool  bmp_baseline_set = false;
+float bmp_alt0         = 0.0f;
+
+// Values-only CSV emitter (requested order)
 static void sendTelemetryValues(Stream &out,
                                 uint32_t teamId,
                                 uint32_t count,
@@ -64,6 +56,7 @@ void tryInitBMP() {
     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
     bmp.setOutputDataRate(BMP3_ODR_50_HZ);
     Serial.println("BMP3XX: initialized");
+    // NOTE: we do NOT reset bmp_baseline_set here; baseline is only set once after boot.
   } else {
     Serial.println("WARN: BMP3XX not found (GP12/GP13). Will retry...");
   }
@@ -73,7 +66,7 @@ void tryInitBNO() {
   bno_ok = bno.begin();
   if (bno_ok) {
     bno.setExtCrystalUse(true);
-    bno.setMode(OPERATION_MODE_NDOF); // Fusion mode
+    bno.setMode(OPERATION_MODE_NDOF);
     Serial.println("BNO055: initialized");
   } else {
     Serial.println("WARN: BNO055 not detected (GP4/GP5). Will retry...");
@@ -85,39 +78,34 @@ void setup() {
   delay(300);
   Serial.println("RP2040 (Philhower) BNO055 + BMP390 -> XBee @ 1 Hz (values-only CSV)");
 
-  // ----------- I2C setup (Philhower supports pin remap) -----------
-  // I2C0 -> BMP3XX on GP12/GP13
+  // I2C0 -> BMP3XX
   Wire.setSDA(12);
   Wire.setSCL(13);
   Wire.begin();
   Wire.setClock(400000);
 
-  // I2C1 -> BNO055 on GP4/GP5
+  // I2C1 -> BNO055
   Wire1.setSDA(4);
   Wire1.setSCL(5);
   Wire1.begin();
   Wire1.setClock(400000);
 
   // Initial attempts (non-blocking)
-  tryInitBMP();
-  lastBMPAttemptMs = millis();
+  tryInitBMP();  lastBMPAttemptMs = millis();
+  tryInitBNO();  lastBNOAttemptMs = millis();
 
-  tryInitBNO();
-  lastBNOAttemptMs = millis();
-
-  // ----------- XBee UART1 (Philhower supports setTX/setRX) -----------
+  // UART1 -> XBee
   Serial1.setTX(XBEE_TX_PIN);
   Serial1.setRX(XBEE_RX_PIN);
   Serial1.begin(XBEE_BAUD);
 
-  // Legend (USB only, once)
   Serial.println("ORDER: TEAMID,COUNT,BMP_ALT_M,BMP_TEMP_C,GYRO_R_DPS,GYRO_P_DPS,GYRO_Y_DPS");
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // Periodic re-init attempts if needed (non-blocking)
+  // Retry inits if needed
   if (!bmp_ok && (now - lastBMPAttemptMs >= REINIT_INTERVAL_MS)) {
     lastBMPAttemptMs = now;
     tryInitBMP();
@@ -127,12 +115,12 @@ void loop() {
     tryInitBNO();
   }
 
-  // 1 Hz throttle
+  // 1 Hz
   if (now - lastPrint < PRINT_INTERVAL_MS) return;
   lastPrint = now;
   packetCount++;
 
-  // ----------- Gyro values -----------
+  // --- Gyro (deg/s) ---
   float gyro_r_dps = 0.0f, gyro_p_dps = 0.0f, gyro_y_dps = 0.0f;
   if (bno_ok) {
     sensors_event_t gyro;
@@ -145,28 +133,42 @@ void loop() {
     }
   }
 
-  // ----------- BMP values -----------
+  // --- BMP temp + relative altitude (zeroed at first good read) ---
   float bmpTempC = 0.0f;
-  float bmp_alt  = 0.0f;
+  float bmp_alt_rel = 0.0f;
+
   if (bmp_ok) {
     if (bmp.performReading()) {
       bmpTempC = bmp.temperature;
-      bmp_alt  = bmp.readAltitude(SEALEVELPRESSURE_HPA); // set QNH for accuracy
+
+      // Absolute altitude from sea-level pressure setting:
+      float alt_abs = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+
+      // Set baseline once, on the first successful read after boot:
+      if (!bmp_baseline_set) {
+        bmp_alt0 = alt_abs;
+        bmp_baseline_set = true;
+        Serial.print("BMP3XX: altitude baseline set to ");
+        Serial.print(bmp_alt0, 2);
+        Serial.println(" m");
+      }
+
+      // Report relative altitude (zero at startup)
+      bmp_alt_rel = alt_abs - bmp_alt0;
     } else {
       Serial.println("WARN: BMP3XX read failed (sending 0.0 for temp/alt).");
     }
   }
 
-  // ----------- Send telemetry (values-only CSV) -----------
+  // --- Telemetry out (values-only CSV) ---
   sendTelemetryValues(Serial1, TEAMID, packetCount,
-                      bmp_alt, bmpTempC,
+                      bmp_alt_rel, bmpTempC,
                       gyro_r_dps, gyro_p_dps, gyro_y_dps);
   Serial1.println();
 
-  // Echo to USB Serial
+  // Echo to USB
   sendTelemetryValues(Serial, TEAMID, packetCount,
-                      bmp_alt, bmpTempC,
+                      bmp_alt_rel, bmpTempC,
                       gyro_r_dps, gyro_p_dps, gyro_y_dps);
   Serial.println();
 }
-
