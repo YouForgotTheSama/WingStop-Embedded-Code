@@ -1,3 +1,17 @@
+// RP2040 (Earle Philhower core) — BNO055 + BMP3XX + XBee (values-only CSV @ 1 Hz)
+// Buses/pins (Philhower supports remapping):
+//   I2C0 (Wire)  : SDA=GP12, SCL=GP13  -> BMP3XX
+//   I2C1 (Wire1) : SDA=GP4,  SCL=GP5   -> BNO055
+//   UART1        : TX=GP0 -> XBee DIN, RX=GP1 <- XBee DOUT  @ 9600
+//
+// Telemetry order:
+//   TEAMID,COUNT,BMP_ALT_M,BMP_TEMP_C,GYRO_R_DPS,GYRO_P_DPS,GYRO_Y_DPS
+
+#if defined(ARDUINO_ARCH_MBED)
+  #error "This sketch requires the Earle Philhower RP2040 core. In Arduino IDE: install 'Raspberry Pi RP2040 Boards' by Earle Philhower and select an RP2040 board from that core."
+#endif
+
+#include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_Sensor.h>
@@ -43,7 +57,6 @@ static void sendTelemetryValues(Stream &out,
 }
 
 void tryInitBMP() {
-  // Try both I2C addresses
   bmp_ok = bmp.begin_I2C(0x77, &Wire) || bmp.begin_I2C(0x76, &Wire);
   if (bmp_ok) {
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
@@ -70,9 +83,9 @@ void tryInitBNO() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("RP2040 BNO055 + BMP390 -> XBee @ 1 Hz (values-only CSV)");
+  Serial.println("RP2040 (Philhower) BNO055 + BMP390 -> XBee @ 1 Hz (values-only CSV)");
 
-  // ----------- I2C setup -----------
+  // ----------- I2C setup (Philhower supports pin remap) -----------
   // I2C0 -> BMP3XX on GP12/GP13
   Wire.setSDA(12);
   Wire.setSCL(13);
@@ -92,7 +105,7 @@ void setup() {
   tryInitBNO();
   lastBNOAttemptMs = millis();
 
-  // ----------- XBee UART1 -----------
+  // ----------- XBee UART1 (Philhower supports setTX/setRX) -----------
   Serial1.setTX(XBEE_TX_PIN);
   Serial1.setRX(XBEE_RX_PIN);
   Serial1.begin(XBEE_BAUD);
@@ -156,3 +169,4 @@ void loop() {
                       gyro_r_dps, gyro_p_dps, gyro_y_dps);
   Serial.println();
 }
+
