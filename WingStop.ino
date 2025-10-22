@@ -141,6 +141,8 @@ void loop() {
         p0_Pa = pressureSum / BASELINE_READINGS;
         baselineSet = true;
         altRel = 0.0f;
+        altPrev = altRel;
+        tPrevMs = now;
       }
     } else {
       altRel = 44330.0f * (1.0f - powf(P_Pa / p0_Pa, 0.190295f));
@@ -178,12 +180,11 @@ void loop() {
   if (!missionStarted && curState == ASCENT) {
     missionStarted = true;
     t0Ms = now;
-    pkt = 0;
   }
 
-  if (missionStarted) {
+  if (baselineSet) {
     pkt++;
-    const uint32_t tMission = now - t0Ms;
+    const uint32_t tMission = missionStarted ? (now - t0Ms) : 0;
     char tStr[16]; missionTime(tStr, sizeof(tStr), tMission);
     sendTelemetry(Serial1, tStr, curState, (payloadReleased ? 'R' : 'N'),
                   altRel, lastTempC, gr, gp, gy);
