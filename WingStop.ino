@@ -1,4 +1,4 @@
- #include <Arduino.h>
+#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
@@ -28,7 +28,7 @@ uint32_t pkt = 0;
 bool     payloadReleased = false;
 bool     baselineSet = false;
 
-float    p0_hPa = 0.0f;
+float    p0_Pa = 0.0f;   // baseline pressure in Pascals
 float    altRel = 0.0f;
 float    lastTempC = 0.0f;
 
@@ -90,7 +90,7 @@ static void sendTelemetry(Stream& out,
 }
 
 void setup() {
-  Wire.begin();              // GP4 SDA, GP5 SCL on Philhower default
+  Wire.begin();              
   Wire.setClock(400000);
 
   bool bmp_ok = bmp.begin_I2C(0x77, &Wire) || bmp.begin_I2C(0x76, &Wire);
@@ -129,13 +129,13 @@ void loop() {
   bool gotAlt = false;
   if (bmp.performReading()) {
     lastTempC = bmp.temperature;
-    const float P_hPa = bmp.pressure;
+    const float P_Pa = bmp.pressure * 100.0f;  // Adafruit BMP3XX .pressure is in hPa in many versions; normalize to Pa
     if (!baselineSet) {
-      p0_hPa = P_hPa;
+      p0_Pa = P_Pa;
       baselineSet = true;
       altRel = 0.0f;
     } else {
-      const float ratio = P_hPa / p0_hPa;
+      const float ratio = P_Pa / p0_Pa;        // unitless; OK regardless of Pa/hPa as long as both match
       altRel = 44330.0f * (1.0f - powf(ratio, 0.190295f));
     }
     gotAlt = true;
