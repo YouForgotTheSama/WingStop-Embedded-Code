@@ -6,38 +6,41 @@
 #include <Servo.h>
 #include <math.h>
 
-#define TEAMID               5
-#define SEPARATION_ALT_M     490.0f
-#define LOOP_PERIOD_MS       1000
-#define XBEE_TX_PIN          0
-#define XBEE_RX_PIN          1
-#define XBEE_BAUD            9600
-#define SERVO_PIN            27
-#define SERVO_CLOSED_DEG     0
-#define SERVO_OPEN_DEG       180
-#define V_ASCENT_THR         2.0f
-#define V_DESCENT_THR       -2.0f
+#define TEAMID                5
+#define SEPARATION_ALT_M      490.0f
+#define APOGEE_MIN_ALT_M      100.0f
+#define LOOP_PERIOD_MS        100
+#define BASELINE_READINGS     20
 
-Adafruit_BMP3XX  bmp;
-Adafruit_BNO055  bno(55, 0x28, &Wire);
-Servo            servo;
+#define XBEE_TX_PIN           0
+#define XBEE_RX_PIN           1
+#define XBEE_BAUD             9600
+#define SERVO_PIN             27
+#define SERVO_CLOSED_DEG      0
+#define SERVO_OPEN_DEG        180
+#define BNO055_SENSOR_ID      55
+#define BNO055_I2C_ADDR       0x28
+
+#define V_ASCENT_THR          2.0f
+#define V_DESCENT_THR         -2.0f
+
+Adafruit_BMP3XX bmp;
+Adafruit_BNO055 bno(BNO055_SENSOR_ID, BNO055_I2C_ADDR, &Wire);
+Servo           servo;
 
 uint32_t lastTickMs = 0;
 uint32_t pkt = 0;
-
 bool     payloadReleased = false;
 bool     baselineSet = false;
-
-float    p0_Pa = 0.0f;   // baseline pressure in Pascals
+float    pressureSum = 0.0f;
+int      pressureReadings = 0;
+float    p0_Pa = 0.0f;
 float    altRel = 0.0f;
 float    lastTempC = 0.0f;
-
 uint32_t tPrevMs = 0;
 float    altPrev = 0.0f;
 float    vVert   = 0.0f;
-
 int      openReassertsRemaining = 0;
-
 bool     missionStarted = false;
 uint32_t t0Ms = 0;
 
@@ -55,50 +58,50 @@ static inline void missionTime(char* out, size_t n, uint32_t ms) {
            (unsigned long)hh, (unsigned long)mm, (unsigned long)ss, (unsigned long)hs);
 }
 
-static FlightState decideState(float alt, float v, bool released, bool haveBaseline) {
+static FlightState decideState(FlightState currentState, float alt, float v, bool haveBaseline) {
   if (!haveBaseline) return LAUNCH_READY;
-  const bool near_ground = (alt < 5.0f);
-  const bool very_still  = (fabsf(v) < 0.3f);
-  if (released || alt >= SEPARATION_ALT_M) {
-    if (near_ground && very_still) return LANDED;
-    if (v > V_ASCENT_THR)          return ASCENT;
-    if (v < -0.2f)                 return DESCENT;
-    return SEPARATE;
+  switch (currentState) {
+    case LAUNCH_READY:
+      if (v > V_ASCENT_THR && alt > 10.0f) return ASCENT;
+      return LAUNCH_READY;
+    case ASCENT: {
+      bool apogeeDetected = (v < 0.0f && alt > APOGEE_MIN_ALT_M);
+      if (alt >= SEPARATION_ALT_M || apogeeDetected) return SEPARATE;
+      return ASCENT;
+    }
+    case SEPARATE:
+      if (v < -0.2f) return DESCENT;
+      return SEPARATE;
+    case DESCENT: {
+      bool near_ground = (alt < 5.0f);
+      bool very_still = (fabsf(v) < 0.3f);
+      if (near_ground && very_still) return LANDED;
+      return DESCENT;
+    }
+    case LANDED:
+      return LANDED;
   }
-  if (v > V_ASCENT_THR)  return ASCENT;
-  if (v < V_DESCENT_THR) return DESCENT;
   return LAUNCH_READY;
 }
 
-static void sendTelemetry(Stream& out,
-                          const char* tStr,
-                          FlightState st,
-                          char payload,
-                          float alt, float temp,
-                          float gr, float gp, float gy)
-{
-  out.print(TEAMID); out.print(',');
-  out.print(tStr);   out.print(',');
-  out.print(pkt);    out.print(',');
-  out.print(STATE_NAME[st]); out.print(',');
-  out.print(payload); out.print(',');
-  out.print((int)roundf(alt));  out.print(',');
-  out.print((int)roundf(temp)); out.print(',');
-  out.print((int)roundf(gr));   out.print(',');
-  out.print((int)roundf(gp));   out.print(',');
-  out.print((int)roundf(gy));
+static void sendTelemetry(Stream& out, const char* tStr, FlightState st, char payload,
+                          float alt, float temp, float gr, float gp, float gy) {
+  out.print(TEAMID); out.print(','); out.print(tStr); out.print(',');
+  out.print(pkt); out.print(','); out.print(STATE_NAME[st]); out.print(',');
+  out.print(payload); out.print(','); out.print((int)roundf(alt)); out.print(',');
+  out.print((int)roundf(temp)); out.print(','); out.print((int)roundf(gr)); out.print(',');
+  out.print((int)roundf(gp)); out.print(','); out.print((int)roundf(gy));
 }
 
 void setup() {
-  Wire.begin();              
+  Wire.begin();
   Wire.setClock(400000);
 
-  bool bmp_ok = bmp.begin_I2C(0x77, &Wire) || bmp.begin_I2C(0x76, &Wire);
-  if (bmp_ok) {
+  if (bmp.begin_I2C()) {
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
     bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    bmp.setOutputDataRate(BMP3_ODR_6_25_HZ);
+    bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
   }
 
   bno.begin();
@@ -129,14 +132,18 @@ void loop() {
   bool gotAlt = false;
   if (bmp.performReading()) {
     lastTempC = bmp.temperature;
-    const float P_Pa = bmp.pressure * 100.0f;  // Adafruit BMP3XX .pressure is in hPa in many versions; normalize to Pa
+    const float P_Pa = bmp.pressure;
     if (!baselineSet) {
-      p0_Pa = P_Pa;
-      baselineSet = true;
-      altRel = 0.0f;
+      if (pressureReadings < BASELINE_READINGS) {
+        pressureSum += P_Pa;
+        pressureReadings++;
+      } else {
+        p0_Pa = pressureSum / BASELINE_READINGS;
+        baselineSet = true;
+        altRel = 0.0f;
+      }
     } else {
-      const float ratio = P_Pa / p0_Pa;        // unitless; OK regardless of Pa/hPa as long as both match
-      altRel = 44330.0f * (1.0f - powf(ratio, 0.190295f));
+      altRel = 44330.0f * (1.0f - powf(P_Pa / p0_Pa, 0.190295f));
     }
     gotAlt = true;
   }
@@ -152,20 +159,23 @@ void loop() {
     vVert = 0.0f;
   }
 
-  if (!payloadReleased && baselineSet && (altRel >= SEPARATION_ALT_M)) {
-    servo.write(SERVO_OPEN_DEG);
+  curState = decideState(curState, altRel, vVert, baselineSet);
+
+  bool commandServoOpen = false;
+  if (curState == SEPARATE && !payloadReleased) {
     payloadReleased = true;
     openReassertsRemaining = 5;
-  }
-
-  if (payloadReleased && openReassertsRemaining > 0) {
-    servo.write(SERVO_OPEN_DEG);
+    commandServoOpen = true;
+  } else if (payloadReleased && openReassertsRemaining > 0) {
     openReassertsRemaining--;
+    commandServoOpen = true;
   }
 
-  curState = decideState(altRel, vVert, payloadReleased, baselineSet);
+  if (commandServoOpen) {
+    servo.write(SERVO_OPEN_DEG);
+  }
 
-  if (!missionStarted && baselineSet && (altRel > 3.0f) && (vVert >= 2.0f)) {
+  if (!missionStarted && curState == ASCENT) {
     missionStarted = true;
     t0Ms = now;
     pkt = 0;
