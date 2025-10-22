@@ -1,17 +1,18 @@
-// RP2040 (official core) — BMP3XX + BNO055 (default I2C GP6/GP7) + Servo + XBee
+// RP2040 (Earle Philhower core) — BMP3XX + BNO055 (I2C1 on GP6/GP7) + Servo + XBee
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include "Adafruit_BMP3XX.h"
 #include <Servo.h>
-#include <math.h>  // for roundf
+#include <math.h>  // roundf, powf
 
 // ---------- Config ----------
 #define TEAMID               5
-#define SEALEVELPRESSURE_HPA 1013.25f
+#define SEPARATION_ALT_M     490.0f
+#define LOOP_PERIOD_MS       1000   // 1 Hz main loop
 
-// UART1 -> XBee
+// UART1 -> XBee (Philhower supports setTX/setRX)
 #define XBEE_TX_PIN          0   // GP0 -> XBee DIN
 #define XBEE_RX_PIN          1   // GP1 <- XBee DOUT
 #define XBEE_BAUD            9600
@@ -20,32 +21,35 @@
 #define SERVO_PIN            27
 #define SERVO_CLOSED_DEG     0
 #define SERVO_OPEN_DEG       180
-#define SEPARATION_ALT_M     490.0f
 
-// Loop rate & thresholds
-#define LOOP_PERIOD_MS       1000   // 1 Hz
-#define V_ASCENT_THR         2.0f   // m/s
-#define V_DESCENT_THR       -2.0f   // m/s
-#define V_STILL_ABS          2.0f   // m/s (|v|<2 => “still”)
+// Vertical speed thresholds (m/s)
+#define V_ASCENT_THR         2.0f
+#define V_DESCENT_THR       -2.0f
+
+// ---------- I2C: Use I2C1 on GP6/GP7 explicitly (matches your wiring/comment) ----------
+TwoWire I2C1(i2c1, 6, 7);
 
 // ---------- Devices ----------
 Adafruit_BMP3XX  bmp;
-Adafruit_BNO055  bno(55, 0x28, &Wire);
+Adafruit_BNO055  bno(55, 0x28, &I2C1);
 Servo            servo;
 
 // ---------- State ----------
 uint32_t lastTickMs = 0;
 uint32_t pkt = 0;
+
 bool     payloadReleased = false;
 bool     baselineSet = false;
 
-float alt0 = 0.0f;     // absolute altitude baseline
-float altRel = 0.0f;   // current relative altitude
-float lastTempC = 0.0f;
+float    p0_hPa = 0.0f;   // baseline pressure for relative altitude
+float    altRel = 0.0f;   // relative altitude from P/P0
+float    lastTempC = 0.0f;
 
-uint32_t tPrevMs = 0;  // for velocity
+uint32_t tPrevMs = 0;     // for velocity
 float    altPrev = 0.0f;
 float    vVert   = 0.0f;
+
+int      openReassertsRemaining = 0;   // (10) reassert servo OPEN a few times
 
 // Flight states
 enum FlightState { LAUNCH_READY, ASCENT, SEPARATE, DESCENT, LANDED };
@@ -53,28 +57,29 @@ const char* STATE_NAME[] = { "LAUNCH_READY","ASCENT","SEPARATE","DESCENT","LANDE
 FlightState curState = LAUNCH_READY;
 
 // ---------- Helpers ----------
-static void missionTime(char* out, size_t n, uint32_t ms) {
-  uint32_t s  = ms / 1000UL;
-  uint32_t hh = s / 3600UL;
-  uint32_t mm = (s % 3600UL) / 60UL;
-  uint32_t ss = s % 60UL;
-  uint32_t hs = (ms % 1000UL) / 10UL;  // hundredths
+static inline void missionTime(char* out, size_t n, uint32_t ms) {
+  const uint32_t s  = ms / 1000UL;
+  const uint32_t hh = s / 3600UL;
+  const uint32_t mm = (s % 3600UL) / 60UL;
+  const uint32_t ss = s % 60UL;
+  const uint32_t hs = (ms % 1000UL) / 10UL;  // hundredths
   snprintf(out, n, "%02lu:%02lu:%02lu.%02lu",
            (unsigned long)hh, (unsigned long)mm, (unsigned long)ss, (unsigned long)hs);
 }
 
+// (5) Avoid apogee=false "LANDED"
 static FlightState decideState(float alt, float v, bool released, bool haveBaseline) {
   if (!haveBaseline) return LAUNCH_READY;
 
-  // Post-separation band
+  const bool near_ground = (alt < 5.0f);
+  const bool very_still  = (fabsf(v) < 0.3f);
+
   if (released || alt >= SEPARATION_ALT_M) {
-    if (v < V_DESCENT_THR)        return DESCENT;
-    if (fabsf(v) < V_STILL_ABS)   return LANDED;
-    if (v > V_ASCENT_THR)         return ASCENT;  // rare edge
+    if (v < V_DESCENT_THR)           return DESCENT;
+    if (near_ground && very_still)   return LANDED;
+    if (v > V_ASCENT_THR)            return ASCENT;
     return SEPARATE;
   }
-
-  // Pre-separation
   if (v > V_ASCENT_THR)  return ASCENT;
   if (v < V_DESCENT_THR) return DESCENT;
   return LAUNCH_READY;
@@ -87,45 +92,41 @@ static void sendTelemetry(Stream& out,
                           float alt, float temp,
                           float gr, float gp, float gy)
 {
-  // Round to nearest integer and print with NO decimals
-  int alt_i  = (int)roundf(alt);
-  int temp_i = (int)roundf(temp);
-  int gr_i   = (int)roundf(gr);
-  int gp_i   = (int)roundf(gp);
-  int gy_i   = (int)roundf(gy);
-
+  // Integers only (no decimals)
   out.print(TEAMID); out.print(',');
   out.print(tStr);   out.print(',');
   out.print(pkt);    out.print(',');
   out.print(STATE_NAME[st]); out.print(',');
   out.print(payload); out.print(',');
-  out.print(alt_i);  out.print(',');
-  out.print(temp_i); out.print(',');
-  out.print(gr_i);   out.print(',');
-  out.print(gp_i);   out.print(',');
-  out.print(gy_i);
+  out.print((int)roundf(alt));  out.print(',');
+  out.print((int)roundf(temp)); out.print(',');
+  out.print((int)roundf(gr));   out.print(',');
+  out.print((int)roundf(gp));   out.print(',');
+  out.print((int)roundf(gy));
 }
 
 // ---------- Setup / Loop ----------
 void setup() {
-  // Default I2C (SDA=GP6, SCL=GP7)
-  Wire.begin();
-  Wire.setClock(400000);
+  // I2C1 at 400 kHz
+  I2C1.begin();
+  I2C1.setClock(400000);
 
-  // Init sensors (simple one-shot init)
-  bmp.begin_I2C(0x77, &Wire) || bmp.begin_I2C(0x76, &Wire);
-  if (bmp.initialized()) {
+  // BMP3XX
+  bool bmp_ok = bmp.begin_I2C(0x77, &I2C1) || bmp.begin_I2C(0x76, &I2C1);
+  if (bmp_ok) {
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
     bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    bmp.setOutputDataRate(BMP3_ODR_50_HZ);
+    // (7) Lower ODR to match slow loop (saves power & noise)
+    bmp.setOutputDataRate(BMP3_ODR_6_25_HZ);
   }
 
+  // BNO055
   bno.begin();
   bno.setExtCrystalUse(true);
   bno.setMode(OPERATION_MODE_NDOF);
 
-  // Telemetry to XBee
+  // XBee UART
   Serial1.setTX(XBEE_TX_PIN);
   Serial1.setRX(XBEE_RX_PIN);
   Serial1.begin(XBEE_BAUD);
@@ -136,8 +137,8 @@ void setup() {
 }
 
 void loop() {
-  uint32_t now = millis();
-  if (now - lastTickMs < LOOP_PERIOD_MS) return;  // 1 Hz
+  const uint32_t now = millis();
+  if (now - lastTickMs < LOOP_PERIOD_MS) return;  // 1 Hz tick
   lastTickMs = now;
   pkt++;
 
@@ -150,32 +151,47 @@ void loop() {
     gy = ge.gyro.z * RAD_TO_DEG;
   }
 
-  // --- Baro: temp + relative altitude (zeroed at first good read) ---
+  // --- Baro: temp + relative altitude from P/P0 (6) ---
   bool gotAlt = false;
   if (bmp.performReading()) {
     lastTempC = bmp.temperature;
-    float altAbs = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-    if (!baselineSet) { alt0 = altAbs; baselineSet = true; }
-    altRel = altAbs - alt0;
+
+    const float P_hPa = bmp.pressure;       // Adafruit BMP3XX reports hPa
+    if (!baselineSet) {
+      p0_hPa = P_hPa;
+      baselineSet = true;
+      altRel = 0.0f;
+    } else {
+      const float ratio = P_hPa / p0_hPa;
+      // h = 44330*(1 - (P/P0)^(1/5.255))
+      altRel = 44330.0f * (1.0f - powf(ratio, 0.190295f));
+    }
     gotAlt = true;
   }
 
   // --- Vertical velocity (simple Δalt/Δt) ---
   if (gotAlt) {
     if (tPrevMs) {
-      float dt = (now - tPrevMs) / 1000.0f;
+      const float dt = (now - tPrevMs) / 1000.0f;
       if (dt > 0) vVert = (altRel - altPrev) / dt;
     }
     altPrev = altRel;
     tPrevMs = now;
   } else {
-    vVert = 0.0f;  // no new sample
+    vVert = 0.0f;
   }
 
-  // --- Payload release at ≥ 490 m ---
+  // --- Separation at ≥ target altitude ---
   if (!payloadReleased && baselineSet && (altRel >= SEPARATION_ALT_M)) {
     servo.write(SERVO_OPEN_DEG);
     payloadReleased = true;
+    openReassertsRemaining = 5;  // (10) reassert OPEN ~5s at 1 Hz
+  }
+
+  // (10) Reassert OPEN a few times after release
+  if (payloadReleased && openReassertsRemaining > 0) {
+    servo.write(SERVO_OPEN_DEG);
+    openReassertsRemaining--;
   }
 
   // --- State & Telemetry ---
