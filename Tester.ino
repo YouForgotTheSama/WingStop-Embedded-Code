@@ -1,192 +1,169 @@
 #include <Arduino.h>
 #include <Wire.h>
+
+// BMP3XX
+#include "Adafruit_BMP3XX.h"
+
+// BNO055
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
-#include "Adafruit_BMP3XX.h"
-#include <Servo.h>
-#include <math.h>
 
-#define TEAMID                5
-#define SEPARATION_ALT_M      490.0f
-#define APOGEE_MIN_ALT_M      100.0f
-#define LOOP_PERIOD_MS        100
-#define BASELINE_READINGS     20
+// u-blox GNSS (ZOE)
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 
-#define XBEE_TX_PIN           0
-#define XBEE_RX_PIN           1
-#define XBEE_BAUD             9600
-#define SERVO_PIN             27
-#define SERVO_CLOSED_DEG      0
-#define SERVO_OPEN_DEG        180
-#define BNO055_SENSOR_ID      55
-#define BNO055_I2C_ADDR       0x28
-
-#define V_ASCENT_THR          2.0f
-#define V_DESCENT_THR         -2.0f
+// ===== I2C addresses (defaults) =====
+constexpr uint8_t I2C_ADDR_BMP3XX = 0x77; // default for Adafruit BMP3xx
+constexpr uint8_t I2C_ADDR_BNO055 = 0x28; // ADR low (default)
+constexpr uint8_t I2C_ADDR_GNSS   = 0x42; // u-blox default
 
 Adafruit_BMP3XX bmp;
-Adafruit_BNO055 bno(BNO055_SENSOR_ID, BNO055_I2C_ADDR, &Wire);
-Servo           servo;
+Adafruit_BNO055 bno(55, I2C_ADDR_BNO055, &Wire);
+SFE_UBLOX_GNSS  gnss;
 
-uint32_t lastTickMs = 0;
-uint32_t pkt = 0;
-bool     payloadReleased = false;
-bool     baselineSet = false;
-float    pressureSum = 0.0f;
-int      pressureReadings = 0;
-float    p0_Pa = 0.0f;
-float    altRel = 0.0f;
-float    lastTempC = 0.0f;
-uint32_t tPrevMs = 0;
-float    altPrev = 0.0f;
-float    vVert   = 0.0f;
-int      openReassertsRemaining = 0;
-bool     missionStarted = false;
-uint32_t t0Ms = 0;
+bool bmp_ok=false, bno_ok=false, gnss_ok=false;
+uint32_t lastPrint=0;
 
-enum FlightState { LAUNCH_READY, ASCENT, SEPARATE, DESCENT, LANDED };
-const char* STATE_NAME[] = { "LAUNCH_READY","ASCENT","SEPARATE","DESCENT","LANDED" };
-FlightState curState = LAUNCH_READY;
-
-static inline void missionTime(char* out, size_t n, uint32_t ms) {
-  const uint32_t s  = ms / 1000UL;
-  const uint32_t hh = s / 3600UL;
-  const uint32_t mm = (s % 3600UL) / 60UL;
-  const uint32_t ss = s % 60UL;
-  const uint32_t hs = (ms % 1000UL) / 10UL;
-  snprintf(out, n, "%02lu:%02lu:%02lu.%02lu",
-           (unsigned long)hh, (unsigned long)mm, (unsigned long)ss, (unsigned long)hs);
+bool beginBMP() {
+  if (!bmp.begin_I2C(I2C_ADDR_BMP3XX, &Wire)) return false;
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
+  return true;
 }
 
-static FlightState decideState(FlightState currentState, float alt, float v, bool haveBaseline) {
-  if (!haveBaseline) return LAUNCH_READY;
-  switch (currentState) {
-    case LAUNCH_READY:
-      if (v > V_ASCENT_THR && alt > 10.0f) return ASCENT;
-      return LAUNCH_READY;
-    case ASCENT: {
-      bool apogeeDetected = (v < 0.0f && alt > APOGEE_MIN_ALT_M);
-      if (alt >= SEPARATION_ALT_M || apogeeDetected) return SEPARATE;
-      return ASCENT;
-    }
-    case SEPARATE:
-      if (v < -0.2f) return DESCENT;
-      return SEPARATE;
-    case DESCENT: {
-      bool near_ground = (alt < 5.0f);
-      bool very_still = (fabsf(v) < 0.3f);
-      if (near_ground && very_still) return LANDED;
-      return DESCENT;
-    }
-    case LANDED:
-      return LANDED;
-  }
-  return LAUNCH_READY;
+bool beginBNO() {
+  if (!bno.begin()) return false;
+  bno.setExtCrystalUse(true);
+  bno.setMode(OPERATION_MODE_NDOF);
+  return true;
 }
 
-static void sendTelemetry(Stream& out, const char* tStr, FlightState st, char payload,
-                          float alt, float temp, float gr, float gp, float gy) {
-  out.print(TEAMID); out.print(','); out.print(tStr); out.print(',');
-  out.print(pkt); out.print(','); out.print(STATE_NAME[st]); out.print(',');
-  out.print(payload); out.print(','); out.print((int)roundf(alt)); out.print(',');
-  out.print((int)roundf(temp)); out.print(','); out.print((int)roundf(gr)); out.print(',');
-  out.print((int)roundf(gp)); out.print(','); out.print((int)roundf(gy));
+bool beginGNSS() {
+  if (!gnss.begin(Wire, I2C_ADDR_GNSS)) return false;
+  gnss.setI2COutput(COM_TYPE_UBX);
+  return true;
 }
 
 void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  Serial.println("CanSat Sensor Test (BMP3XX default addr, BNO055, u-blox ZOE)");
+
   Wire.begin();
   Wire.setClock(400000);
 
-  if (bmp.begin_I2C()) {
-    bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-    bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-    bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
-  }
+  bmp_ok = beginBMP();
+  bno_ok = beginBNO();
+  gnss_ok = beginGNSS();
 
-  bno.begin();
-  bno.setExtCrystalUse(true);
-  bno.setMode(OPERATION_MODE_NDOF);
-
-  Serial1.setTX(XBEE_TX_PIN);
-  Serial1.setRX(XBEE_RX_PIN);
-  Serial1.begin(XBEE_BAUD);
-
-  servo.attach(SERVO_PIN, 500, 2500);
-  servo.write(SERVO_CLOSED_DEG);
+  Serial.print("BMP3XX: "); Serial.println(bmp_ok ? "OK" : "NOT FOUND");
+  Serial.print("BNO055 : "); Serial.println(bno_ok ? "OK" : "NOT FOUND");
+  Serial.print("GNSS   : "); Serial.println(gnss_ok ? "OK" : "NOT FOUND");
+  Serial.println("---- Reading at 1 Hz ----");
 }
 
 void loop() {
   const uint32_t now = millis();
-  if (now - lastTickMs < LOOP_PERIOD_MS) return;
-  lastTickMs = now;
+  if (now - lastPrint < 1000) return;
+  lastPrint = now;
 
-  float gr = 0, gp = 0, gy = 0;
-  sensors_event_t ge;
-  if (bno.getEvent(&ge, Adafruit_BNO055::VECTOR_GYROSCOPE)) {
-    gr = ge.gyro.x * RAD_TO_DEG;
-    gp = ge.gyro.y * RAD_TO_DEG;
-    gy = ge.gyro.z * RAD_TO_DEG;
+  float tempC = NAN, press_kPa = NAN;
+  if (bmp_ok && bmp.performReading()) {
+    tempC = bmp.temperature;
+    press_kPa = bmp.pressure * 0.001f; // Pa -> kPa
   }
 
-  bool gotAlt = false;
-  if (bmp.performReading()) {
-    lastTempC = bmp.temperature;
-    const float P_Pa = bmp.pressure;
-    if (!baselineSet) {
-      if (pressureReadings < BASELINE_READINGS) {
-        pressureSum += P_Pa;
-        pressureReadings++;
-      } else {
-        p0_Pa = pressureSum / BASELINE_READINGS;
-        baselineSet = true;
-        altRel = 0.0f;
-      }
-    } else {
-      altRel = 44330.0f * (1.0f - powf(P_Pa / p0_Pa, 0.190295f));
+  float euler_h=NAN, euler_r=NAN, euler_p=NAN;
+  float gyro_x=NAN, gyro_y=NAN, gyro_z=NAN;
+  if (bno_ok) {
+    sensors_event_t orient;
+    if (bno.getEvent(&orient, Adafruit_BNO055::VECTOR_EULER)) {
+      euler_h = orient.orientation.x;
+      euler_r = orient.orientation.z;
+      euler_p = orient.orientation.y;
     }
-    gotAlt = true;
+    sensors_event_t ge;
+    if (bno.getEvent(&ge, Adafruit_BNO055::VECTOR_GYROSCOPE)) {
+      gyro_x = ge.gyro.x * RAD_TO_DEG;
+      gyro_y = ge.gyro.y * RAD_TO_DEG;
+      gyro_z = ge.gyro.z * RAD_TO_DEG;
+    }
   }
 
-  if (gotAlt) {
-    if (tPrevMs) {
-      const float dt = (now - tPrevMs) / 1000.0f;
-      if (dt > 0) vVert = (altRel - altPrev) / dt;
+  bool hasFix=false;
+  uint8_t fixType=0, siv=0;
+  long lat_e7=0, lon_e7=0, alt_mm=0;
+  uint16_t year=0; uint8_t mon=0, day=0, hr=0, min=0, sec=0;
+  if (gnss_ok) {
+    fixType = gnss.getFixType();
+    hasFix = (fixType >= 2);
+    siv = gnss.getSIV();
+    if (hasFix) {
+      lat_e7 = gnss.getLatitude();
+      lon_e7 = gnss.getLongitude();
+      alt_mm = gnss.getAltitude();
     }
-    altPrev = altRel;
-    tPrevMs = now;
+    year = gnss.getYear(); mon = gnss.getMonth(); day = gnss.getDay();
+    hr = gnss.getHour();   min = gnss.getMinute(); sec = gnss.getSecond();
+  }
+
+  Serial.println("===== SENSOR READ =====");
+  if (bmp_ok) {
+    Serial.print("BMP3XX  | Temp(C): ");
+    Serial.print(isnan(tempC) ? NAN : tempC, 2);
+    Serial.print("  Press(kPa): ");
+    Serial.println(isnan(press_kPa) ? NAN : press_kPa, 2);
   } else {
-    vVert = 0.0f;
+    Serial.println("BMP3XX  | not detected");
   }
 
-  curState = decideState(curState, altRel, vVert, baselineSet);
-
-  bool commandServoOpen = false;
-  if (curState == SEPARATE && !payloadReleased) {
-    payloadReleased = true;
-    openReassertsRemaining = 5;
-    commandServoOpen = true;
-  } else if (payloadReleased && openReassertsRemaining > 0) {
-    openReassertsRemaining--;
-    commandServoOpen = true;
+  if (bno_ok) {
+    Serial.print("BNO055  | Euler(deg) H/R/P: ");
+    if (isnan(euler_h)) Serial.print("nan"); else Serial.print(euler_h, 1);
+    Serial.print("/");
+    if (isnan(euler_r)) Serial.print("nan"); else Serial.print(euler_r, 1);
+    Serial.print("/");
+    if (isnan(euler_p)) Serial.print("nan"); else Serial.print(euler_p, 1);
+    Serial.print("  Gyro(deg/s) X/Y/Z: ");
+    if (isnan(gyro_x)) Serial.print("nan"); else Serial.print(gyro_x, 1);
+    Serial.print("/");
+    if (isnan(gyro_y)) Serial.print("nan"); else Serial.print(gyro_y, 1);
+    Serial.print("/");
+    if (isnan(gyro_z)) Serial.print("nan"); else Serial.print(gyro_z, 1);
+    Serial.println();
+  } else {
+    Serial.println("BNO055  | not detected");
   }
 
-  if (commandServoOpen) {
-    servo.write(SERVO_OPEN_DEG);
-  }
-
-  if (!missionStarted && curState == ASCENT) {
-    missionStarted = true;
-    t0Ms = now;
-    pkt = 0;
-  }
-
-  if (missionStarted) {
-    pkt++;
-    const uint32_t tMission = now - t0Ms;
-    char tStr[16]; missionTime(tStr, sizeof(tStr), tMission);
-    sendTelemetry(Serial1, tStr, curState, (payloadReleased ? 'R' : 'N'),
-                  altRel, lastTempC, gr, gp, gy);
-    Serial1.println();
+  if (gnss_ok) {
+    Serial.print("GNSS    | FixType:");
+    Serial.print(fixType);
+    Serial.print("  SIV:");
+    Serial.print(siv);
+    Serial.print("  Time(UTC): ");
+    if (year) {
+      char tbuf[24];
+      snprintf(tbuf, sizeof(tbuf), "%04u-%02u-%02u %02u:%02u:%02u",
+               (unsigned)year,(unsigned)mon,(unsigned)day,(unsigned)hr,(unsigned)min,(unsigned)sec);
+      Serial.print(tbuf);
+    } else {
+      Serial.print("n/a");
+    }
+    Serial.print("  Pos: ");
+    if (hasFix) {
+      Serial.print(lat_e7 / 1e7, 5);
+      Serial.print(", ");
+      Serial.print(lon_e7 / 1e7, 5);
+      Serial.print("  Alt(m): ");
+      Serial.print(alt_mm / 1000.0, 2);
+    } else {
+      Serial.print("no fix");
+    }
+    Serial.println();
+  } else {
+    Serial.println("GNSS    | not detected");
   }
 }
+
