@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include "Adafruit_BMP3XX.h"
@@ -24,29 +25,39 @@
 #define V_ASCENT_THR          2.0f
 #define V_DESCENT_THR         -2.0f
 
+SFE_UBLOX_GNSS myGNSS;
 Adafruit_BMP3XX bmp;
 Adafruit_BNO055 bno(BNO055_SENSOR_ID, BNO055_I2C_ADDR, &Wire);
-Servo           servo;
+Servo servo;
 
 uint32_t lastTickMs = 0;
 uint32_t pkt = 0;
-bool     payloadReleased = false;
-bool     baselineSet = false;
-float    pressureSum = 0.0f;
-int      pressureReadings = 0;
-float    p0_Pa = 0.0f;
-float    altRel = 0.0f;
-float    lastTempC = 0.0f;
+bool payloadReleased = false;
+bool baselineSet = false;
+float pressureSum = 0.0f;
+int   pressureReadings = 0;
+float p0_Pa = 0.0f;
+float altRel = 0.0f;
+float lastTempC = 0.0f;
 uint32_t tPrevMs = 0;
-float    altPrev = 0.0f;
-float    vVert   = 0.0f;
-int      openReassertsRemaining = 0;
-bool     missionStarted = false;
+float altPrev = 0.0f;
+float vVert = 0.0f;
+int openReassertsRemaining = 0;
+bool missionStarted = false;
 uint32_t t0Ms = 0;
+
+long gpsLat_e7 = 0;
+long gpsLon_e7 = 0;
+uint32_t lastGpsMs = 0;
+float lastPressurePa = 0.0f;
 
 enum FlightState { LAUNCH_READY, ASCENT, SEPARATE, DESCENT, LANDED };
 const char* STATE_NAME[] = { "LAUNCH_READY","ASCENT","SEPARATE","DESCENT","LANDED" };
 FlightState curState = LAUNCH_READY;
+FlightState prevState = LAUNCH_READY;
+
+bool telemetryHalted = false;
+uint32_t launchExitMs = 0;
 
 static inline void missionTime(char* out, size_t n, uint32_t ms) {
   const uint32_t s  = ms / 1000UL;
@@ -85,24 +96,43 @@ static FlightState decideState(FlightState currentState, float alt, float v, boo
 }
 
 static void sendTelemetry(Stream& out, const char* tStr, FlightState st, char payload,
-                          float alt, float temp, float gr, float gp, float gy) {
-  out.print(TEAMID); out.print(','); out.print(tStr); out.print(',');
-  out.print(pkt); out.print(','); out.print(STATE_NAME[st]); out.print(',');
-  out.print(payload); out.print(','); out.print((int)roundf(alt)); out.print(',');
-  out.print((int)roundf(temp)); out.print(','); out.print((int)roundf(gr)); out.print(',');
-  out.print((int)roundf(gp)); out.print(','); out.print((int)roundf(gy));
+                          float alt, float temp, long lat_e7, long lon_e7,
+                          float gr, float gp, float gy, float pressPa, float v) {
+  const float lat_deg = lat_e7 / 1e7f;
+  const float lon_deg = lon_e7 / 1e7f;
+
+  out.print(TEAMID); out.print(',');
+  out.print(tStr); out.print(',');
+  out.print(pkt); out.print(',');
+  out.print(STATE_NAME[st]); out.print(',');
+  out.print(payload); out.print(',');
+  out.print((int)roundf(alt)); out.print(',');
+  out.print((int)roundf(temp)); out.print(',');
+  out.print(lat_deg, 5); out.print(',');
+  out.print(lon_deg, 5); out.print(',');
+  out.print((int)roundf(gr)); out.print(',');
+  out.print((int)roundf(gp)); out.print(',');
+  out.print((int)roundf(gy));
+  out.print(',');  // blank field 1
+  out.print(',');  // blank field 2
+  out.print((int)roundf(pressPa * 0.001f)); out.print(','); // kPa
+  out.print((int)roundf(v));
 }
 
 void setup() {
+  Serial.begin(115200);
+
   Wire.begin();
   Wire.setClock(400000);
 
-  if (bmp.begin_I2C()) {
-    bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-    bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-    bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
-  }
+  myGNSS.begin(Wire, 0x42);
+  myGNSS.setI2COutput(COM_TYPE_UBX);
+
+  bmp.begin_I2C(0x77, &Wire) || bmp.begin_I2C(0x76, &Wire);
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
 
   bno.begin();
   bno.setExtCrystalUse(true);
@@ -129,10 +159,18 @@ void loop() {
     gy = ge.gyro.z * RAD_TO_DEG;
   }
 
+  if (now - lastGpsMs >= 1000) {
+    lastGpsMs = now;
+    gpsLat_e7 = myGNSS.getLatitude();
+    gpsLon_e7 = myGNSS.getLongitude();
+  }
+
   bool gotAlt = false;
   if (bmp.performReading()) {
     lastTempC = bmp.temperature;
     const float P_Pa = bmp.pressure;
+    lastPressurePa = P_Pa;
+
     if (!baselineSet) {
       if (pressureReadings < BASELINE_READINGS) {
         pressureSum += P_Pa;
@@ -161,7 +199,15 @@ void loop() {
     vVert = 0.0f;
   }
 
+  prevState = curState;
   curState = decideState(curState, altRel, vVert, baselineSet);
+
+  if (prevState == LAUNCH_READY && curState != LAUNCH_READY && launchExitMs == 0) {
+    launchExitMs = now; // mark the moment we leave LAUNCH_READY
+  }
+  if (launchExitMs && (now - launchExitMs >= 5000)) {
+    telemetryHalted = true; // stop telemetry 5 seconds after launch
+  }
 
   bool commandServoOpen = false;
   if (curState == SEPARATE && !payloadReleased) {
@@ -172,22 +218,19 @@ void loop() {
     openReassertsRemaining--;
     commandServoOpen = true;
   }
-
-  if (commandServoOpen) {
-    servo.write(SERVO_OPEN_DEG);
-  }
+  if (commandServoOpen) servo.write(SERVO_OPEN_DEG);
 
   if (!missionStarted && curState == ASCENT) {
     missionStarted = true;
     t0Ms = now;
   }
 
-  if (baselineSet) {
+  if (baselineSet && !telemetryHalted) {
     pkt++;
     const uint32_t tMission = missionStarted ? (now - t0Ms) : 0;
     char tStr[16]; missionTime(tStr, sizeof(tStr), tMission);
     sendTelemetry(Serial1, tStr, curState, (payloadReleased ? 'R' : 'N'),
-                  altRel, lastTempC, gr, gp, gy);
+                  altRel, lastTempC, gpsLat_e7, gpsLon_e7, gr, gp, gy, lastPressurePa, vVert);
     Serial1.println();
   }
 }
