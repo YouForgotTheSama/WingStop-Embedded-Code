@@ -55,11 +55,11 @@ static inline void missionTime(char* out, size_t n, uint32_t ms){
   snprintf(out,n,"%02lu:%02lu:%02lu.%02lu",(unsigned long)hh,(unsigned long)mm,(unsigned long)ss,(unsigned long)hs);
 }
 
-static inline void normalizeCommand(char* buf){
-  char* start=buf; while(*start==' '||*start=='\t') ++start;
-  char* end=start+strlen(start); while(end>start && (end[-1]==' '||end[-1]=='\t')) --end;
-  size_t len=(size_t)(end-start); memmove(buf,start,len); buf[len]='\0';
-  for(size_t i=0;i<len;++i) buf[i]=(char)toupper((unsigned char)buf[i]);
+static inline void normalize_to_lower(char* buf){
+  char* a=buf; while(*a==' '||*a=='\t') ++a;
+  char* b=a+strlen(a); while(b>a && (b[-1]==' '||b[-1]=='\t'||b[-1]=='\r')) --b;
+  size_t n=(size_t)(b-a); memmove(buf,a,n); buf[n]='\0';
+  for(size_t i=0;i<n;++i) buf[i]=(char)tolower((unsigned char)buf[i]);
 }
 
 static inline void sendTelemetry(Print& out,const char* tStr,FlightState st,char payload,
@@ -79,14 +79,19 @@ static inline void sendTelemetry(Print& out,const char* tStr,FlightState st,char
 static inline void initPeripherals(){
   Wire.begin(); Wire.setClock(400000);
   gnss.begin(Wire,I2C_ADDR_GNSS); gnss.setI2COutput(COM_TYPE_UBX);
-  (void)(bmp.begin_I2C(I2C_ADDR_BMP3XX_A,&Wire)||bmp.begin_I2C(I2C_ADDR_BMP3XX_B,&Wire));
+  (void)(bmp.begin_I2C(I2C_ADDR_BMP3XX_A,&Wire) || bmp.begin_I2C(I2C_ADDR_BMP3XX_B,&Wire));
   bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
   bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
   bno.begin(); bno.setExtCrystalUse(true); bno.setMode(OPERATION_MODE_NDOF);
   Serial1.setTX(PIN_XBEE_TX); Serial1.setRX(PIN_XBEE_RX); Serial1.begin(XBEE_BAUD);
-  servo.attach(PIN_SERVO,500,2500); servo.write(SERVO_CLOSED_DEG);
+  servo.attach(PIN_SERVO,500,2500);
+  servo.write(SERVO_CLOSED_DEG);
+#ifdef LED_BUILTIN
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+#endif
 }
 
 static inline void tickGyro(){
@@ -134,9 +139,14 @@ static inline FlightState decideState(FlightState current,float alt,float v){
 
 static inline void updateStateAndServo(uint32_t now){
   if(curState==LAUNCH_READY){
-    if(baselineSet && vVert>V_ASCENT_THR && altRel>10.0f){ if(ascentConfirm<3) ++ascentConfirm; }
-    else ascentConfirm=0;
-    if(ascentConfirm>=3){ curState=ASCENT; missionStarted=true; t0Ms=now; }
+    if(baselineSet && vVert>V_ASCENT_THR && altRel>10.0f){
+      if(ascentConfirm<3) ++ascentConfirm;
+    } else ascentConfirm=0;
+    if(ascentConfirm>=3){
+      curState=ASCENT;
+      missionStarted=true;
+      t0Ms=now;
+    }
   } else {
     curState=decideState(curState,altRel,vVert);
   }
@@ -151,28 +161,37 @@ static inline void handleGroundCommands(uint32_t now_ms){
   while(Serial1.available()>0){
     char c=(char)Serial1.read(); if(c=='\r') continue;
     if(c!='\n' && idx<sizeof(buf)-1){ buf[idx++]=c; continue; }
-    buf[idx]='\0'; idx=0; normalizeCommand(buf);
-    if(!strcmp(buf,"HOT HONEY")){
+    buf[idx]='\0'; idx=0; normalize_to_lower(buf);
+    if(!buf[0]) continue;
+    if(!strcmp(buf,"hot honey")){
       float p_avg=(pressureReads>0)?(pressureSum/(float)pressureReads):lastPressurePa;
       if(p_avg<=0.0f && bmp.performReading()){ lastPressurePa=bmp.pressure; p_avg=lastPressurePa; }
-      if(p_avg>0.0f){ p0_Pa=p_avg; baselineSet=true; altRel=0.0f; altPrev=0.0f; tPrevMs=now_ms;
+      if(p_avg>0.0f){
+        p0_Pa=p_avg; baselineSet=true; altRel=0.0f; altPrev=0.0f; tPrevMs=now_ms;
         const int kPa=(int)lroundf(p0_Pa*0.001f);
-        Serial1.print("ACK,HOT_HONEY,BASELINE_SET,"); Serial1.println(kPa);
-      } else { Serial1.println("ERR,NO_PRESSURE"); }
+        Serial1.print("ack,hot_honey,baseline_set,"); Serial1.println(kPa);
+      } else {
+        Serial1.println("err,no_pressure");
+      }
       continue;
     }
-    if(!strcmp(buf,"LEMON PEPPER")){
+    if(!strcmp(buf,"lemon pepper")){
       servo.write(SERVO_OPEN_DEG); payloadReleased=true; openReasserts=SERVO_REASSERT_N;
-      Serial1.println("ACK,LEMON_PEPPER,SERVO_OPEN");
+      Serial1.println("ack,lemon_pepper,servo_open");
       continue;
     }
-    if(!strcmp(buf,"PING")){ Serial1.println("ACK,PONG"); continue; }
-    if(buf[0]){ Serial1.print("ERR,BAD_CMD,"); Serial1.println(buf); }
+    if(!strcmp(buf,"lemon pepper close")){
+      payloadReleased=false;
+      servo.write(SERVO_CLOSED_DEG);
+      Serial1.println("ack,lemon_pepper,servo_closed");
+      continue;
+    }
+    if(!strcmp(buf,"ping")){ Serial1.println("ack,pong"); continue; }
+    Serial1.print("err,bad_cmd,"); Serial1.println(buf);
   }
 }
 
 void setup(){
-  Serial.begin(115200);
   initPeripherals();
 }
 
@@ -181,17 +200,18 @@ void loop(){
   handleGroundCommands(now);
   if(now-lastTickMs<LOOP_PERIOD_MS) return;
   lastTickMs=now;
-
   tickGyro();
   tickGPS(now);
   bool haveAlt=tickBaro();
   updateVelocityIfNew(now,haveAlt);
   updateStateAndServo(now);
-
-  if(baselineSet){
+  static uint32_t lastTx=0;
+  if(now - lastTx >= 1000){
+    lastTx = now;
     ++pkt;
-    const uint32_t tMission = missionStarted ? (now - t0Ms) : 0;
-    char tStr[16]; missionTime(tStr,sizeof(tStr),tMission);
+    char tStr[16];
+    if (missionStarted) missionTime(tStr,sizeof(tStr),(now - t0Ms));
+    else                snprintf(tStr,sizeof(tStr),"--:--:--.--");
     sendTelemetry(Serial1,tStr,curState,(payloadReleased?'R':'N'),
                   altRel,lastTempC,gpsLat_e7,gpsLon_e7,lastGr,lastGp,lastGy,lastPressurePa,vVert);
   }
