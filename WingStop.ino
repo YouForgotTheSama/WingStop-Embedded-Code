@@ -16,8 +16,7 @@ constexpr uint8_t PIN_SERVO         = 27;
 
 constexpr uint8_t I2C_ADDR_GNSS     = 0x42;
 constexpr uint8_t I2C_ADDR_BNO055   = 0x28;
-constexpr uint8_t I2C_ADDR_BMP3XX_A = 0x77;
-constexpr uint8_t I2C_ADDR_BMP3XX_B = 0x76;
+constexpr uint8_t I2C_ADDR_BMP3XX   = 0x77;
 
 constexpr uint8_t  TEAMID               = 5;
 constexpr float    SEPARATION_ALT_M     = 490.0f;
@@ -79,7 +78,7 @@ static inline void sendTelemetry(Print& out,const char* tStr,FlightState st,char
 static inline void initPeripherals(){
   Wire.begin(); Wire.setClock(400000);
   gnss.begin(Wire,I2C_ADDR_GNSS); gnss.setI2COutput(COM_TYPE_UBX);
-  (void)(bmp.begin_I2C(I2C_ADDR_BMP3XX_A,&Wire) || bmp.begin_I2C(I2C_ADDR_BMP3XX_B,&Wire));
+  bmp.begin_I2C(I2C_ADDR_BMP3XX, &Wire);
   bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
   bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
@@ -167,7 +166,9 @@ static inline void handleGroundCommands(uint32_t now_ms){
       float p_avg=(pressureReads>0)?(pressureSum/(float)pressureReads):lastPressurePa;
       if(p_avg<=0.0f && bmp.performReading()){ lastPressurePa=bmp.pressure; p_avg=lastPressurePa; }
       if(p_avg>0.0f){
-        p0_Pa=p_avg; baselineSet=true; altRel=0.0f; altPrev=0.0f; tPrevMs=now_ms;
+        p0_Pa=p_avg; baselineSet=true; altRel=0.0f; altPrev=0.0f; vVert=0.0f; tPrevMs=now_ms;
+        missionStarted=false; t0Ms=0; ascentConfirm=0; curState=LAUNCH_READY;
+        payloadReleased=false; openReasserts=0;
         const int kPa=(int)lroundf(p0_Pa*0.001f);
         Serial1.print("ack,hot_honey,baseline_set,"); Serial1.println(kPa);
       } else {
@@ -211,7 +212,7 @@ void loop(){
     ++pkt;
     char tStr[16];
     if (missionStarted) missionTime(tStr,sizeof(tStr),(now - t0Ms));
-    else                snprintf(tStr,sizeof(tStr),"--:--:--.--");
+    else                strcpy(tStr,"00:00:00.00");
     sendTelemetry(Serial1,tStr,curState,(payloadReleased?'R':'N'),
                   altRel,lastTempC,gpsLat_e7,gpsLon_e7,lastGr,lastGp,lastGy,lastPressurePa,vVert);
   }
