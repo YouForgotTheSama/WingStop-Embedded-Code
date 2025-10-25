@@ -4,6 +4,8 @@
 #include <Adafruit_BNO055.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <Servo.h>
+#include <string.h>
+#include <SD.h>
 
 #define xbee_TX 0
 #define xbee_RX 1
@@ -19,11 +21,12 @@
 Adafruit_BMP3XX BMP;
 SFE_UBLOX_GNSS GPS;
 Adafruit_BNO055 BNO;
-Servo ServoP;
-int TEAMID = 5; 
+Servo Servo;
+File dataFile;
 
+int TEAMID = 5; 
 int PACKET_COUNT = 0;
-String SW_STATE = "LAUNCH_READY";
+char SW_STATE[13] = "LAUNCH-READY";
 char PL_STATE = 'N';
 float ALTITUDE = 0;
 float TEMP = 0;
@@ -97,12 +100,10 @@ void setup (){
   Serial.println("Xbee start");
 
   //DataLogger is Serial 2 
-  Serial2.setTX (datalogger_TX);
-  Serial2.setRX (datalogger_RX);
-  Serial2.begin (9600);
-  Serial.println("(datalogger start)");
+  if (SD.begin(datalogger_RX)) 
+    dataFile = SD.open("data.csv , FILE_WRITE");
 
-  ServoP.attach(ServoPin);
+  Servo.attach(ServoPin);
 
   pinMode(Buzzer, OUTPUT);
   digitalWrite(Buzzer, LOW);
@@ -129,22 +130,24 @@ void takeData(){
 }
 
 void changeState(){
-  if (SW_STATE == "LAUNCH_READY" && ALTITUDE >= 10){
-    SW_STATE = "ASCENT"; //Add Mission start here
+  if ((strcmp(SW_STATE, "LAUNCH-READY") == 0) && ALTITUDE >= 10){
+    SW_STATE == "ASCENT"; //Add Mission start here
   }
-  else if (SW_STATE == "ASCENT" && ALTITUDE >= 490){
-    SW_STATE = "SEPERATE"; 
-    ServoP.attach(180); 
+  else if ((strcmp(SW_STATE, "ASCENT") == 0) && ALTITUDE >= 490){
+    SW_STATE == "SEPARATE"; 
+    Servo.write(180); 
     PL_STATE = 'R' ;
   }
-  else if (SW_STATE == "SEPERATE" && ALTITUDE <490){
-    SW_STATE = "DESCENT";
+  else if ((strcmp(SW_STATE, "SEPARATE") == 0) && ALTITUDE <490){
+    SW_STATE == "DESCENT";
   }
-  else if (SW_STATE == "DESCENT" && ALTITUDE <10){
-    SW_STATE = "LANDED";
+  else if ((strcmp(SW_STATE, "DESCENT") == 0) && ALTITUDE <10){
+    SW_STATE == "LANDED";
     digitalWrite(Buzzer, HIGH);
     digitalWrite(LED, HIGH);
   }
+  //make sure you end telemetry
+
 }
 
 void sendData(){
@@ -156,6 +159,8 @@ void sendData(){
   sprintf(XbeeString, "%i,%s,%i,%s,%c,%.2f,%.2f,%.1f,%.4f,%.4f,%.2f,%.2f,%.2f,,%.2f,%.5f",TEAMID,SPRING_TIME,PACKET_COUNT,SW_STATE,PL_STATE,ALTITUDE,TEMP,VOLTAGE,LAT,LONG,GYRO_R,GYRO_P,GYRO_Y,PRESSURE,VELOCITY);
   Serial1.println (XbeeString);
   Serial2.println (XbeeString);
+  dataFile.println (XbeeString);
+  dataFile.flush();
 }
 
 unsigned long STARTTIME = millis();
