@@ -1,134 +1,208 @@
-// Board: Raspberry Pi Pico (rp2040:rp2040:rpipico)
-// UART0 (Serial1): TX=GP0, RX=GP1 (defaults)
-// I2C0 (Wire): SDA=GP4, SCL=GP5 (defaults)
 
-#include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
-
 #include <Adafruit_BMP3XX.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
+#include <Servo.h>
+#include <string.h>
+#include <SD.h>
 
-// ===== Config =====
-#define XBEE_BAUD 9600
-#define TEAMID    5
-#define SEALEVELPRESSURE_HPA 1013.25
+#define xbee_TX 0
+#define xbee_RX 1
+#define allSensorsSDA 4
+#define allSensorsSCL 5
+#define datalogger_TX 8
+#define datalogger_RX 9
+#define Buzzer 10 
+#define ServoPin 16
+#define LED 17
+#define voltagemeasure 26
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 25 // Pico onboard LED (GP25)
-#endif
+Adafruit_BMP3XX BMP;
+SFE_UBLOX_GNSS GPS;
+Adafruit_BNO055 BNO;
+Servo Servo1;
+File dataFile;
 
-// ===== Sensors =====
-Adafruit_BMP3XX bmp;                  // BMP3xx @ 0x77
-Adafruit_BNO055 bno(55, 0x28);        // BNO055 @ 0x28 (ADR low) on Wire
-SFE_UBLOX_GNSS  gnss;                 // u-blox ZOE @ 0x42 (I2C)
+int TEAMID = 5; 
+int PACKET_COUNT = 0;
+char SW_STATE[50] = "LAUNCH-READY";
+char PL_STATE = 'N';
+float ALTITUDE = 0;
+float TEMP = 0;
+float VOLTAGE = 0;
+float LAT = 0;
+float LONG = 0;
+float GYRO_R = 0;
+float GYRO_P = 0;
+float GYRO_Y = 0;
+float PRESSURE = 0;
+float VELOCITY = 0;
+float SEALEVELPRESSURE_HPA = 1013.25;
+char command[67];
 
-bool bmp_ok=false, bno_ok=false, gnss_ok=false;
-uint32_t packetCount = 0, lastSend = 0;
+uint16_t BNO055_SAMPLERATE_DELAY_MS = 100;
+sensors_event_t orientationData;
 
-bool beginBMP() {
-  if (!bmp.begin_I2C(0x77, &Wire)) return false;
-  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
-  return true;
-}
-bool beginBNO() {
-  if (!bno.begin()) return false;
-  bno.setExtCrystalUse(true);
-  bno.setMode(OPERATION_MODE_NDOF);
-  return true;
-}
-bool beginGNSS() {
-  if (!gnss.begin(Wire, 0x42)) return false; // I2C (Wire) @ 0x42
-  gnss.setI2COutput(COM_TYPE_UBX);           // quieter bus
-  return true;
-}
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
-void setup() {
-  // No USB Serial usage
+void setup (){
+  Serial.begin (9600);
+  Serial.println("(setup start)");
+  Wire.setSDA(allSensorsSDA);
+  Wire.setSCL(allSensorsSCL);
+  Wire.begin();
 
-  // XBee on UART0 (GP0/GP1)
-  Serial1.begin(XBEE_BAUD);
+  if (!BNO.begin()){
+    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+  }
+  Serial.println("(BNO start)");
 
-  // I2C0 (Wire) for all sensors
-  Wire.begin();            // SDA=GP4, SCL=GP5
-  Wire.setClock(400000);   // use 100000 if you have long wires
 
-  // Keep Pico LED ON
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+  if (!BMP.begin_I2C()){
+    Serial.println("Could not find a valid BMP3 sensor, check wiring!");
+  }
+  BMP.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+  BMP.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+  BMP.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  BMP.setOutputDataRate(BMP3_ODR_50_HZ);
+  Serial.println("(BMP start)");
+  //BMP calibration zone
+  BMP.performReading();
+  BMP.performReading();
+  BMP.performReading();
+  BMP.performReading();
+  BMP.performReading();
+  float ref1 = BMP.pressure / 100.0;
+  BMP.performReading();
+  float ref2 = BMP.pressure / 100.0;
+  BMP.performReading();
+  float ref3 = BMP.pressure / 100.0;
+  BMP.performReading();
+  float ref4 = BMP.pressure / 100.0;
+  BMP.performReading();
+  float ref5 = BMP.pressure / 100.0;
+  BMP.performReading();
+  float reference_press = (ref1 + ref2 + ref3 + ref4 + ref5)/5;
+  SEALEVELPRESSURE_HPA = reference_press;
 
-  // Init sensors (on Wire only)
-  bmp_ok  = beginBMP();
-  bno_ok  = beginBNO();
-  gnss_ok = beginGNSS();
-}
 
-void loop() {
-  // 1 Hz telemetry
-  uint32_t now = millis();
-  if (now - lastSend < 1000) return;
-  lastSend = now;
-  packetCount++;
+  if (GPS.begin() == false) {
+    Serial.println(F("u-blox GNSS not detected at default I2C address. Please check wiring. Freezing."));
+  }
+  GPS.setI2COutput(COM_TYPE_UBX);
+  GPS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
+  Serial.println("(GPS start)");
 
-  // --- BMP3XX (integers only) ---
-  int tempC_i = 0;
-  int altBaro_m_i = 0;
-  if (bmp_ok && bmp.performReading()) {
-    float tempC = bmp.temperature;                        // °C
-    float alt_m = bmp.readAltitude(SEALEVELPRESSURE_HPA); // m
-    tempC_i     = (int)lroundf(tempC);
-    altBaro_m_i = (int)lroundf(alt_m);
+  //XBee is Serial 1
+  Serial1.setTX (xbee_TX);
+  Serial1.setRX (xbee_RX);
+  Serial1.begin (9600);
+  Serial.println("Xbee start");
+
+  //DataLogger is Serial 2 
+  Serial2.setTX (datalogger_TX);
+  Serial2.setRX (datalogger_RX);
+  Serial2.begin (9600);
+  Serial.println("(datalogger start)");
+
+  //DataLogger is Serial 2 
+  if (SD.begin(datalogger_RX)){ 
+    dataFile = SD.open("data.csv , FILE_WRITE");
   }
 
-  // --- BNO055 gyro (deg/s, integers) ---
-  int gx_i=0, gy_i=0, gz_i=0;
-  if (bno_ok) {
-    sensors_event_t gyr;
-    if (bno.getEvent(&gyr, Adafruit_BNO055::VECTOR_GYROSCOPE)) {
-      gx_i = (int)lroundf(gyr.gyro.x * RAD_TO_DEG);
-      gy_i = (int)lroundf(gyr.gyro.y * RAD_TO_DEG);
-      gz_i = (int)lroundf(gyr.gyro.z * RAD_TO_DEG);
+  Servo1.attach(ServoPin);
+
+  pinMode(Buzzer, OUTPUT);
+  digitalWrite(Buzzer, LOW);
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+
+}
+
+void takeCommand(){
+  if (Serial.available() > 0){
+    int i = 0;
+    while (Serial.available()){;
+      command[i] = Serial.read();
+      i++;
+    }
+
+    if (strcmp(command, "lemon pepper") == 0){
+      strcpy(SW_STATE, "ASCENT");
+      Servo1.write(180);
+    }
+    else if (strcmp(command, "hot honey") == 0){
+      ALTITUDE = BMP.readAltitude (SEALEVELPRESSURE_HPA);
     }
   }
+}
 
-  // --- GNSS (integers) ---
-  uint8_t fixType = 0, siv = 0;
-  long lat_e7 = 0, lon_e7 = 0;
-  int altGNSS_m_i = 0;
-  if (gnss_ok) {
-    fixType = gnss.getFixType();  // 0=no fix, 2=2D, 3=3D, etc.
-    siv     = gnss.getSIV();
-    if (fixType >= 2) {
-      lat_e7      = gnss.getLatitude();    // 1e-7 deg
-      lon_e7      = gnss.getLongitude();   // 1e-7 deg
-      long altmm  = gnss.getAltitude();    // mm
-      altGNSS_m_i = (int)lroundf(altmm / 1000.0f);
-    }
+void takeData(){
+  ALTITUDE = BMP.readAltitude (SEALEVELPRESSURE_HPA);
+  TEMP = BMP.readTemperature();
+  VOLTAGE = analogRead(voltagemeasure);
+  VOLTAGE = ((3.3 * VOLTAGE)/4095.0);
+  VOLTAGE = VOLTAGE * ((68000 + 100000)/100000);
+  //resistor values need to be given by eletrical and resistor2 will be bigger value
+  LAT = GPS.getLatitude();
+  LONG = GPS.getLongitude();
+  BNO.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
+  GYRO_R = (orientationData.orientation.x);
+  GYRO_P = (orientationData.orientation.y);
+  GYRO_Y = (orientationData.orientation.z);
+  PRESSURE = BMP.readPressure();
+
+}
+
+void changeState(){
+  if ((strcmp(SW_STATE, "LAUNCH-READY") == 0) && ALTITUDE >= 10){
+    strcpy(SW_STATE, "ASCENT");
   }
+  else if ((strcmp(SW_STATE, "ASCENT") == 0) && ALTITUDE >= 490){
+    strcpy(SW_STATE, "SEPARATE");
+    Servo1.write(180); 
+    PL_STATE = 'R' ;
+  }
+  else if ((strcmp(SW_STATE, "SEPARATE") == 0) && ALTITUDE <490){
+    strcpy(SW_STATE, "DESCENT");
+  }
+  else if ((strcmp(SW_STATE, "DESCENT") == 0) && ALTITUDE <10){
+    strcpy(SW_STATE, "LANDED");
+    digitalWrite(Buzzer, HIGH);
+    digitalWrite(LED, HIGH);
+  }
+  //make sure you end telemetry
 
-  // --- Format with printf-style, then send over XBee (UART0) ---
-  // CSV layout: <TEAM,PACKET,TcC,AltB_m,Gx,Gy,Gz,Fix,SIV,LatE7,LonE7,AltG_m>
-  char line[160];
-  int n = snprintf(
-    line, sizeof(line),
-    "<%d,%lu,%d,%d,%d,%d,%d,%u,%u,%ld,%ld,%d>",
-    TEAMID,
-    (unsigned long)packetCount,
-    tempC_i,
-    altBaro_m_i,
-    gx_i, gy_i, gz_i,
-    (unsigned)fixType,
-    (unsigned)siv,
-    lat_e7, lon_e7,
-    altGNSS_m_i
-  );
-  if (n > 0) {
-    Serial1.write(line, (size_t)n);
-    Serial1.write('\n'); // end-of-line
+}
+
+void sendData(){
+  PACKET_COUNT +=1;
+  unsigned long RUNTIME = millis();
+  char SPRING_TIME[25];
+  sprintf(SPRING_TIME, "%02ld:%02ld:%02ld.%02ld", (RUNTIME / (1000*60*60)) %100, (RUNTIME / (1000*60)) %60, (RUNTIME / 1000) %60);
+  char XbeeString[500];
+  sprintf(XbeeString, "%i,%s,%i,%s,%c,%.2f,%.2f,%.1f,%.4f,%.4f,%.2f,%.2f,%.2f,,%.2f,%.5f",TEAMID,SPRING_TIME,PACKET_COUNT,SW_STATE,PL_STATE,ALTITUDE,TEMP,VOLTAGE,LAT,LONG,GYRO_R,GYRO_P,GYRO_Y,PRESSURE,VELOCITY);
+  Serial1.println (XbeeString);
+  Serial2.println (XbeeString);
+  dataFile.println (XbeeString);
+  dataFile.flush ();
+}
+
+unsigned long STARTTIME = millis();
+float STARTALT = ALTITUDE;
+
+void loop(){
+  takeCommand();
+  takeData();
+  changeState();
+
+  unsigned long CURRENTTIME = millis();
+  if ((CURRENTTIME - STARTTIME) > 1000){
+    VELOCITY = (ALTITUDE - STARTALT)/((CURRENTTIME - STARTTIME)/1000);
+    STARTALT = ALTITUDE;
+    sendData();
+    STARTTIME = CURRENTTIME;
   }
 }

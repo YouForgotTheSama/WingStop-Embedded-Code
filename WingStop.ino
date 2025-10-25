@@ -1,3 +1,4 @@
+
 #include <Wire.h>
 #include <Adafruit_BMP3XX.h>
 #include <Adafruit_Sensor.h>
@@ -26,7 +27,7 @@ File dataFile;
 
 int TEAMID = 5; 
 int PACKET_COUNT = 0;
-char SW_STATE[13] = "LAUNCH-READY";
+char SW_STATE[50] = "LAUNCH-READY";
 char PL_STATE = 'N';
 float ALTITUDE = 0;
 float TEMP = 0;
@@ -39,6 +40,7 @@ float GYRO_Y = 0;
 float PRESSURE = 0;
 float VELOCITY = 0;
 float SEALEVELPRESSURE_HPA = 1013.25;
+char command[67];
 
 uint16_t BNO055_SAMPLERATE_DELAY_MS = 100;
 sensors_event_t orientationData;
@@ -100,8 +102,15 @@ void setup (){
   Serial.println("Xbee start");
 
   //DataLogger is Serial 2 
-  if (SD.begin(datalogger_RX)) 
+  Serial2.setTX (datalogger_TX);
+  Serial2.setRX (datalogger_RX);
+  Serial2.begin (9600);
+  Serial.println("(datalogger start)");
+
+  //DataLogger is Serial 2 
+  if (SD.begin(datalogger_RX)){ 
     dataFile = SD.open("data.csv , FILE_WRITE");
+  }
 
   Servo1.attach(ServoPin);
 
@@ -110,6 +119,24 @@ void setup (){
   pinMode(LED, OUTPUT);
   digitalWrite(LED, LOW);
 
+}
+
+void takeCommand(){
+  if (Serial.available() > 0){
+    int i = 0;
+    while (Serial.available()){
+      command[i] = Serial.read();
+      i++;
+    }
+
+    if (strcmp(command, "lemon pepper") == 0){
+      SW_STATE == "SEPARATE";
+      Servo1.write(180);
+    }
+    else if (strcmp(command, "hot honey") == 0){
+      ALTITUDE = BMP.readAltitude (SEALEVELPRESSURE_HPA);
+    }
+  }
 }
 
 void takeData(){
@@ -131,7 +158,7 @@ void takeData(){
 
 void changeState(){
   if ((strcmp(SW_STATE, "LAUNCH-READY") == 0) && ALTITUDE >= 10){
-    SW_STATE == "ASCENT"; 
+    SW_STATE == "ASCENT"; //Add Mission start here
   }
   else if ((strcmp(SW_STATE, "ASCENT") == 0) && ALTITUDE >= 490){
     SW_STATE == "SEPARATE"; 
@@ -146,6 +173,7 @@ void changeState(){
     digitalWrite(Buzzer, HIGH);
     digitalWrite(LED, HIGH);
   }
+  //make sure you end telemetry
 
 }
 
@@ -159,14 +187,14 @@ void sendData(){
   Serial1.println (XbeeString);
   Serial2.println (XbeeString);
   dataFile.println (XbeeString);
-  dataFile.flush();
+  dataFile.flush ();
 }
 
 unsigned long STARTTIME = millis();
 float STARTALT = ALTITUDE;
 
 void loop(){
-
+  takeCommand();
   takeData();
   changeState();
 
