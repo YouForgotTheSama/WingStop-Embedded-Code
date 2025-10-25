@@ -21,7 +21,7 @@
 Adafruit_BMP3XX BMP;
 SFE_UBLOX_GNSS GPS;
 Adafruit_BNO055 BNO;
-Servo Servo;
+Servo Servo1;
 File dataFile;
 
 int TEAMID = 5; 
@@ -103,7 +103,7 @@ void setup (){
   if (SD.begin(datalogger_RX)) 
     dataFile = SD.open("data.csv , FILE_WRITE");
 
-  Servo.attach(ServoPin);
+  Servo1.attach(ServoPin);
 
   pinMode(Buzzer, OUTPUT);
   digitalWrite(Buzzer, LOW);
@@ -135,7 +135,7 @@ void changeState(){
   }
   else if ((strcmp(SW_STATE, "ASCENT") == 0) && ALTITUDE >= 490){
     SW_STATE == "SEPARATE"; 
-    Servo.write(180); 
+    Servo1.write(180); 
     PL_STATE = 'R' ;
   }
   else if ((strcmp(SW_STATE, "SEPARATE") == 0) && ALTITUDE <490){
