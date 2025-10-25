@@ -131,7 +131,7 @@ void takeData(){
 
 void changeState(){
   if ((strcmp(SW_STATE, "LAUNCH-READY") == 0) && ALTITUDE >= 10){
-    SW_STATE == "ASCENT"; //Add Mission start here
+    SW_STATE == "ASCENT"; 
   }
   else if ((strcmp(SW_STATE, "ASCENT") == 0) && ALTITUDE >= 490){
     SW_STATE == "SEPARATE"; 
@@ -146,7 +146,6 @@ void changeState(){
     digitalWrite(Buzzer, HIGH);
     digitalWrite(LED, HIGH);
   }
-  //make sure you end telemetry
 
 }
 
